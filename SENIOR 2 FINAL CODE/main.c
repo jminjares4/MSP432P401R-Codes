@@ -51,15 +51,15 @@
  *                                    GND
  *
  *             -----------------
- *            | Pressure Sensor |
+ *            | Analog Readings |
  *             -----------------
  *               MSP432P401x
  *             -----------------
  *            |                 |
  *            |                 |
- *            |          (P5.4) |--> 10k Pot
+ *            |          (P5.4) |--> Pressure Sensor
  *            |                 |
- *            |                 |
+ *            |          (P5.5) |--> Solar Panel
  *            |                 |
  *            |                 |
  *            |_________________|
@@ -70,6 +70,49 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include "GPS.h"
+
+/*Solar Tracker*/
+#define SAMPLE  15
+#define CLK 3000000
+#define ROW 21
+#define COL 21
+#define ON  1
+#define OFF 0
+uint16_t sample[SAMPLE];
+float ADC14BIT = 16384;
+float VPos = 3.30;
+float VNeg = 0.0; //set float variable to get voltage reading
+uint16_t pulse[] = {3000,
+                    3150,
+                    3300,
+                    3450,
+                    3600,
+                    3750,
+                    3900,
+                    4050,
+                    4200,
+                    4350,
+                    4500,
+                    4650,
+                    4800,
+                    4950,
+                    5100,
+                    5250,
+                    5400,
+                    5550,
+                    5700,
+                    5850,
+                    6000}; // 20 steps array for the PWM of the motor
+uint8_t flag = 0;
+uint32_t harvesting = 0; //software flag and harvesting counter
+uint16_t axis[ROW][COL]; //set grid of ROW * COL, adc value at 0
+uint8_t RANGE, tic = 0, y = 0, x = 0, count = 0;
+float volt = 0; //voltage variable
+int overSample = 0; //sample counter
+uint16_t* findMax(int row, int col);
+void port2Setup(uint8_t pwmBit);
+void pwmSetup();
+void clear(int row, int col); //clear array/matrix
 
 /*Port Remap */
 void portRemap(); //reconfigure UART1 pin P2.2 -> P3.0 for a more practical use
@@ -104,7 +147,7 @@ void puttySetup(); //enable PcEcho
 
 /*Timer A2*/
 void timerA2Setup(); //set timerA2 @ 10ms intervals
-SysTime setSysTime(const UTC_TIME  *gpsUtcTime); //set sysTime data structure using UTC_TIME data structure
+
 
 /*Data Structures*/
 NMEA_GNRMC gps; //hold GNMRC parsed
@@ -118,7 +161,7 @@ typedef struct SysTime{
     uint16_t milli;
 }SysTime;
 SysTime sysTime; //create an instance of the sysTime data structure to hold current time
-
+SysTime setSysTime(const UTC_TIME  *gpsUtcTime); //set sysTime data structure using UTC_TIME data structure
 /*Global variables*/
 char *gpsUartStr = "GNRMC"; //string that is going to search
 const char carriageReturn = 13; //  '\r'
@@ -129,6 +172,13 @@ char buffer[82]; //82 bytes long as the NMEA is the max size of a string
 void main(void){
     WDT_A->CTL = WDT_A_CTL_PW | WDT_A_CTL_HOLD;     // stop watchdog timer
 
+
+    /*SOLAR TRACKER*/
+    RANGE = sizeof(pulse)/sizeof(uint16_t);
+    clear(RANGE,RANGE);
+    port2Setup(0xC0); //BIT6|BIT7 -> 1100 0000, C0
+    pwmSetup();
+
     /*Initialize Clock at 3Mhz*/
     set3Mhz();
     /*initialize putty for debugging*/
@@ -136,7 +186,7 @@ void main(void){
     /*initialize gpsUart to get data*/
     gpsUARTSetup();
     /*enable ENable pin for the GPS*/
-    gpsToggleSetup(BIT6);
+    gpsToggleSetup(0x40); //BIT6 -> 0100 0000, 40
 
     /*enable bluetooth*/
     bluetoothSetup();
@@ -163,13 +213,14 @@ void main(void){
     //print_UTC_TIME(&gpsTime);
 
 
-    /*enable 5.4 for ADC*/
-    port5Setup(BIT4);
+    /*enable 5.4 and 5.5 for ADC*/
+    port5Setup(0x30); //BIT4|BIT5 -> 0011 0000 , 30
 
     /*enable TimerA2 at 10ms*/
     timerA2Setup();
     /*enable single channel repeat at 100Hz*/
     adcSetup();
+
 
     /*enable global interrupts*/
     __enable_irq();
@@ -339,7 +390,8 @@ void EUSCIA1_IRQHandler(void){
         /*the gps will end with \r\n\0, so check if the last 3 character match */
         if(buffer[buffer_index-2] == carriageReturn && buffer[buffer_index - 1] == newLineFeed  && buffer[buffer_index] == '\0'){
             if(isSubstring((char*)buffer,gpsUartStr) && gpsColdStart++ < 50){ //check if gpsUartStr is a substring and if gpsColdStart is < 50
-                sendBluetooth(buffer); //send via bluetooth
+//                sendBluetooth(buffer); //send via bluetooth
+                  sendPutty(buffer);
             }
             if(gpsColdStart < 50){ //if gpsColdStart still less than 50
                 memset(&buffer,0,sizeof(buffer)); //clear the buffer
@@ -418,10 +470,11 @@ char *getCoordinate(){
  */
 void adcSetup(){
     // set as sample trigger, predivde clock by 64, divide by 5, sample hold time of 14, adc on
-    ADC14->CTL0 =  ADC14_CTL0_SHP| ADC14_CTL0_ON | ADC14_CTL0_SHT0__192; // 3mhz/64/6/(64 + 14+2) == 97. hertz
+    ADC14->CTL0 =  ADC14_CTL0_SHP| ADC14_CTL0_ON | ADC14_CTL0_SHT0__192 |ADC14_CTL0_MSC| ADC14_CTL0_CONSEQ_3; // 3mhz/64/6/(64 + 14+2) == 97. hertz
     ADC14->CTL1 = ADC14_CTL1_RES_3;         // Use sampling timer, 14-bit conversion results
-    ADC14->MCTL[0] |= ADC14_MCTLN_INCH_1;   // A1 ADC input select; Vref=AVCC
-    ADC14->IER0 |= ADC14_IER0_IE0;          // Enable ADC conv complete interrupt>
+    ADC14->MCTL[1] |= ADC14_MCTLN_INCH_1 | ADC14_MCTLN_EOS;   // A1 , 5.4 ADC input select; Vref=AVCC
+    ADC14->MCTL[0] |= ADC14_MCTLN_INCH_0;  // A0, 5.5
+    ADC14->IER0 |= ADC14_IER0_IE1;        // Enable ADC conv complete interrupt>
     NVIC->ISER[0] = 1 << ((ADC14_IRQn) & 31); //enable adc
     ADC14->CTL0 |= ADC14_CTL0_ENC | ADC14_CTL0_SC; //enable conversion and start conversion
 }
@@ -462,26 +515,77 @@ void TA2_0_IRQHandler(){
     if(sysTime.second >= 59){ sysTime.minute++; sysTime.second = 0; }
     if(sysTime.minute >= 59){ sysTime.hour++;   sysTime.minute = 0; }
     if(sysTime.hour >= 23){   sysTime.hour = 0;}
-    TIMER_A2->CCTL[0] &= ~TIMER_A_CCTLN_CCIFG; //clear the capture and compare flag of the timer
-    if(sysTime.milli % 10 == 0)
+    if(sysTime.milli % 10 == 0){ //every 10ms, trigger conversion
+        tic++; //increment tic
+        if(tic == SAMPLE){ //every 15*10ms -> 150ms
+             y++;//increment the index of the array
+             if(y == RANGE){ //clear i when exceed to the end
+                  y = 0; // set to 0
+                  x++; //increment x axis
+             }
+             if(x == RANGE ){ //once X reaches LIMIT turn on flag
+                 flag = ON; //turn flag on
+             }
+             if(flag == ON){
+                 harvesting++; //start harvesting
+                 if(harvesting == 1){
+                    uint16_t *index =  findMax(ROW, COL); //find the max value of the grid
+                    TIMER_A0->CCR[3] = pulse[index[1]] - 1; // change to the current pulse
+                    TIMER_A0->CCR[4] = pulse[index[0]] - 1; // set to the max value index
+
+                    volt = VPos/ADC14BIT * axis[index[0]][index[1]]; //convert digital reading into voltage
+
+                 }
+                 if(harvesting > 1200000){// 120000/1000/60 -> 2 minutes
+                     harvesting = x = volt = flag = OFF;
+                     clear(RANGE,RANGE); //clear the grid
+                 }
+             }
+             if(flag == OFF){
+                TIMER_A0->CCR[3] = pulse[y] - 1; // change to the current pulse
+                TIMER_A0->CCR[4] = pulse[x] - 1; // ^
+
+                int i = 1;
+                for(; i < SAMPLE; i++) //sum the samples to get an average
+                    overSample += sample[i];
+
+                uint16_t avg = (uint16_t)(overSample / (SAMPLE - 1)); //get the average reading in the ADC
+
+                volt = VPos/ADC14BIT *avg; //convert average digital to voltage
+
+                axis[x][y] = avg ; //store current avg reading into axis
+                flag = OFF; //set flag as OFF
+             }
+             tic = 0; overSample = 0;
+        }
         ADC14->CTL0 |= ADC14_CTL0_ENC | ADC14_CTL0_SC; //enable sample and start conversion
+    }
+    TIMER_A2->CCTL[0] &= ~TIMER_A_CCTLN_CCIFG; //clear the capture and compare flag of the timer
 }
+
 /**
  * ADC Interrupt Subroutine
  * @note    Get ADC reading every 10ms, and time stamp stamp the data
  *          send data via bluetooth once it done capturing
  */
 void ADC14_IRQHandler(void){
-    uint32_t adcRawReading = ADC14->MEM[0]; //save adc reading
-    char tempBuffer[48] = ""; //create an empty buffer
-    char *time = getTime(); //store time
+    uint32_t adcRawReading = ADC14->MEM[1]; //A1 save adc reading
+    uint32_t solarReading = ADC14->MEM[0];// A0
+    if(ADC14->IFGR0 & ADC14_IFGR0_IFG1){
+        char tempBuffer[48] = ""; //create an empty buffer
+        char *time = getTime(); //store time
 
-    sprintf(tempBuffer,"%s %s ",gpsCoordinates.latitude, gpsCoordinates.longitude);
-    sendBluetooth(tempBuffer);
+        sprintf(tempBuffer,"%s %s ",gpsCoordinates.latitude, gpsCoordinates.longitude);
+//        sendBluetooth(tempBuffer);
+        sendPutty(tempBuffer);
 
-    sendBluetooth(time);
-    sprintf(tempBuffer, "%u %lf\r\n",adcRawReading, (3.3/16384 * adcRawReading)); // output the message of adc reading
-    sendBluetooth(tempBuffer); //send message
+//        sendBluetooth(time);
+        sendPutty(time);
+        sprintf(tempBuffer, "%u %lf\r\n",adcRawReading, (3.3/16384 * adcRawReading)); // output the message of adc reading
+//        sendBluetooth(tempBuffer); //send message
+        sendPutty(tempBuffer);
+        sample[tic] = solarReading;
+    }
 }
 /**
  * @param   None
@@ -521,4 +625,59 @@ void sendBluetooth(char *message){
             EUSCI_A2->TXBUF = message[i];
     }
     return;
+}
+/**
+ * @param   row and col of 2D array
+ * @return  unsigned int of 16 bytes pointer that hold the axis coordinate for the max
+ *          value with the grid
+ * @note    find the max value within the 2D array
+ */
+uint16_t* findMax(int row, int col){
+    static uint16_t index[2]; //local variable to store the index for max number
+
+    int tempMax = axis[0][0], i,j; //save first number to get temporary Max number
+    for(i = 0; i < row; i++){   //iterate over the row
+        for( j = 0; j < col; j++){  //iterate over col
+            if(axis[i][j] > tempMax){ //if the current axis[i][j] is greater than the current maxValue, then save values
+                index[0] = i; //get xAxis index for max value
+                index[1] = j; //get yAxis index for max Value
+                tempMax = axis[i][j]; //store max Value at the temporary
+            }
+        }
+    }
+    return index; //return pointer
+}
+/**
+ * @param   unsigned int of 8 byte, BIT to set PWM
+ * @return  None
+ */
+void port2Setup(uint8_t pwmBit){
+    P2->SEL0 |= pwmBit; //enable PWM for pwmBit
+    P2->SEL1 &= ~(pwmBit); //bit clear pin select
+    P2->DIR |= pwmBit; //set bit for output
+    P2->OUT |= pwmBit; //output the bit
+    return;
+}
+/**
+ * @param   None
+ * @return  None
+ * @note    Set P2.6 and P2.7 as PWM pin with a frequency of 50Hz for
+ *          SG90 servo motors starting at 5% duty cycle
+ */
+void pwmSetup(){
+    TIMER_A0->CTL = TIMER_A_CTL_MC_1 | TIMER_A_CTL_ID_0 | TIMER_A_CTL_TASSEL_2; // upMode, SMCLK, divide by 2^0
+    TIMER_A0->CCTL[3] = TIMER_A_CCTLN_OUTMOD_7; //set Reset/Set...always use for PWM
+    TIMER_A0->CCTL[4] = TIMER_A_CCTLN_OUTMOD_7; //set for RESET/SET
+    TIMER_A0->CCR[0] = 60000 - 1; //set frequency at 20ms or 50hz
+    TIMER_A0->CCR[3] = pulse[0] - 1; //set duty at 5%
+    TIMER_A0->CCR[4] = pulse[0] - 1; //set at the first index of the pulse
+    return;
+}
+/**
+ * @param   row and col of 2D array
+ * @return  None
+ * @note    use memset to clear the element in the 2D
+ */
+void clear(int row, int col){
+    memset(axis,0,sizeof(uint16_t)*row*col);
 }
